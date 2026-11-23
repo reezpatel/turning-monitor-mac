@@ -1,131 +1,125 @@
-# 帧率问题：测量结果与已验证结论
+# Frame-rate issues: measurements and verified conclusions
 
-> 状态：**部分解决**。本文档记录 2026-11-22/23 在两块图灵 12.3"（720×1920）
-> 上测得的全部数字、已验证的修复、以及被否决的方案。后续优化从这里继续，
-> 不要重试标了 ❌ 的路线 —— 每一条都在真机上验证过失败方式。
+> Status: **resolved**. This records every number measured on two Turing 12.3" panels
+> (720×1920) on 2026-11-22/23, the verified fixes, and the rejected approaches. Do not retry
+> the routes marked ❌: each one was tried on real hardware and failed in the way described.
 
-## 测量基线（单面板，1920×720 landscape，30fps/16Mbit/s）
+## Baseline (one panel, 1920×720 landscape, 30 fps / 16 Mbit/s)
 
-| 场景 | 帧率 | 数据率 | 队列深度 |
+| Scenario | Frame rate | Data rate | Queue depth |
 |---|---|---|---|
-| 纯 USB 推流（`turzx video` 预编码文件，绕过采集） | **~27 fps** | ~460 KB/s | — |
-| 纯采集编码（虚拟屏 + ScreenCaptureKit + VideoToolbox，无 USB） | **~25 fps** | ~10 KB/s | — |
-| monitor 完整管线（采集→编码→USB，串行循环，原始代码） | **15–17 fps** | ~100–160 KB/s | 0 |
-| monitor 完整管线（v2 修复后：1ms probe + 逐帧队列节奏） | **~15.5 fps** | ~145 KB/s | 0，55 秒 1400 帧零重置 |
+| Pure USB push (`turzx video`, pre-encoded file, no capture) | **~27 fps** | ~460 KB/s | n/a |
+| Pure capture + encode (virtual display + ScreenCaptureKit + VideoToolbox, no USB) | **~25 fps** | ~10 KB/s | n/a |
+| Full monitor pipeline (capture → encode → USB, serial loop, original code) | **15–17 fps** | ~100–160 KB/s | 0 |
+| Full pipeline after the v2 fix (1 ms probe + per-frame queue pacing) | **~15.5 fps** | ~145 KB/s | 0, 1400 frames in 55 s, zero resets |
 
-关键结论：
-- 面板解码/USB 链路本身能跑 27fps，**面板不是瓶颈**
-- 采集端能产出 25fps，**采集不是瓶颈**
-- `queue=0` 恒定：面板始终在等主机喂 —— **主机侧的每帧成本是瓶颈**
-- 27 与 15.5 之间的差距 ≈ 每帧 ~25ms 的额外串行成本
+Early conclusions (later refined, see the final section):
 
-## 每帧成本的构成（单 chunk 帧的串行路径）
+- The panel's decode/USB link can do 27 fps, so **the panel is not the bottleneck**
+- Capture can produce 25 fps, so **capture is not the bottleneck**
+- `queue=0` throughout: the panel is always waiting for the host to feed it, so a **per-frame
+  host-side cost** is the bottleneck
+- The gap between 27 and 15.5 is about 25 ms of extra serial cost per frame
+
+## Per-frame cost of a single-chunk frame (serial path)
 
 ```
-session.Next()     等下一帧到达        （与 USB 串行时纯属闲置）
-d.Send(chunk):     bulk OUT 写          ~几 ms（数据本身）
-                  读设备应答            ~几 ms（往返）
-                  flushLocked() 探测    3ms × 5 = 最多 15ms（v2 后 1ms × 5）
-waitForQueue():    CmdStreamStatus 往返 ~几 ms（v2 起每帧一次）
+session.Next()     wait for the next frame      (pure idle time when serial with USB)
+d.Send(chunk):     bulk OUT write               a few ms (the data itself)
+                   read the device reply        a few ms (round trip)
+                   flushLocked() probe          3 ms × 5 = up to 15 ms (1 ms × 5 after v2)
+waitForQueue():    CmdStreamStatus round trip   a few ms (once per frame since v2)
 ```
 
-## ✅ 已验证的修复（v2，已合入）
+## ✅ Verified fixes (v2, merged)
 
-1. **flushTimeout 3ms → 1ms**。probe 探测在端点空时按超时全额支付，
-   3ms×5 每帧最多 15ms。1ms 后空端点成本降到 ~1ms。
-   （`internal/usb/transport.go`）
-2. **逐帧队列节奏**。`SendVideoFrame` 现在在每个 chunk 后轮询
-   `CmdStreamStatus`（原来只在同一帧的 chunk 之间）。这是流不溢出设备
-   播放队列的保证。（`internal/usb/ops.go`）
+1. **flushTimeout 3 ms → 1 ms.** The probe pays its full timeout when the endpoint is empty,
+   so 3 ms × 5 cost up to 15 ms per frame. With 1 ms an empty endpoint costs about 1 ms.
+   (`internal/usb/transport.go`)
+2. **Per-frame queue pacing.** `SendVideoFrame` now polls `CmdStreamStatus` after every chunk
+   (previously only between chunks of the same frame). This is what guarantees the stream
+   cannot overflow the device's playback queue. (`internal/usb/ops.go`)
 
-   v2 结果：55 秒连续推流、1400+ 帧、**零会话重置**、15.5fps 稳定。
+   v2 result: 55 s of continuous streaming, 1400+ frames, **zero session resets**.
 
-## ❌ 已否决的方案（勿重试）
+## ❌ Rejected approaches (do not retry)
 
-### 1. Fire-and-forget chunk（不等应答直接写下一个）
-- **现象**：fps 崩到 0.5，帧尺寸异常（70KB），随后
-  `usb write: transfer was cancelled`，会话崩溃循环。
-- **根因**：协议是严格请求-响应。设备的 IN 端点应答缓冲有限；应答不被
-  读取时端点回压，固件最终**完全停止接受写入**。ack 计数器 + 后台
-  drain goroutine（100ms ticker）也救不回来 —— 应答节奏本身就是节流。
-- **附带损伤**：崩溃循环的反复重开会把面板打到串口号丢失
-  （`turzx info` 显示 serial 为空），需要物理重插恢复。
-  本会话中发生过多次，均为此原因。
+### 1. Fire-and-forget chunks (write the next chunk without waiting for the reply)
+- **Symptom**: fps collapses to 0.5, frames come out oddly sized (70 KB), then
+  `usb write: transfer was cancelled` and a crash loop.
+- **Root cause**: the protocol is strictly request/response. The device's IN endpoint has a
+  limited reply buffer; when replies are not read the endpoint backs up and the firmware
+  eventually **stops accepting writes entirely**. An ack counter plus a background drain
+  goroutine (100 ms ticker) did not save it either; the reply cadence is itself the throttle.
+- **Collateral damage**: the repeated reopen of a crash loop can knock the panel into losing
+  its serial number (`turzx info` shows an empty serial), which needs a physical replug.
+  This happened several times, always for this reason.
 
-### 2. 跳过流式路径的 flushLocked（只在非流式命令后 drain）
-- **现象**：连接后第一个 prelude 写就挂满 5s 超时，
-  `stop-video: usb write: transfer was cancelled`。
-- **根因**：**每次应答后的 drain 是 load-bearing，不是卫生措施**。
-  设备在某些命令后会发出多于调用者读取数量的块；不排干则端点逐渐
-  回压直到固件拒写。表现为面板"卡死"，只能断电恢复。
-- **教训**：原版 3ms×5 的 flush 又慢又必要 —— 慢的是实现（固定超时
-  轮询），必要的是语义（读到空）。v2 保留了语义，只把成本降到 1ms。
+### 2. Skipping flushLocked on the streaming path (drain only after non-streaming commands)
+- **Symptom**: the very first prelude write after connecting hangs for the 5 s timeout, and
+  `stop-video: usb write: transfer was cancelled` follows.
+- **Root cause**: **the drain after every reply is load-bearing, not hygiene.** After some
+  commands the device emits more blocks than the caller reads; if they are not drained the
+  endpoint backs up until the firmware refuses writes. The panel appears frozen and only
+  power-cycling recovers it.
+- **Lesson**: the original 3 ms × 5 flush was both slow and necessary. The implementation
+  (fixed-timeout polling) was slow; the semantics (read until empty) were necessary. v2 keeps
+  the semantics and cuts the cost to 1 ms.
 
-### 3. 流水线化帧循环（采集与 USB 发送重叠）
-- **做法**：`session.Next()` 与 `SendVideoFrame` 各占一个 goroutine，
-  发上一帧的同时采集下一帧。
-- **现象**：fps 从 10 衰减到 ~1（约 100 帧内），无会话重置。
-- **根因（已定位，未修复）**：`session.Next()` 返回的切片**只保证到
-  下次调用前有效**（内部复用单一缓冲）。发送 goroutine 还在传时，
-  下一次 `Next()` 已覆写字节 —— H.264 流被破坏，面板解码器失步，
-  表现为越跑越慢。修复方向已写入代码：发送前 copy 一份
-  （`cmd/turzx/main.go` streamToPanel，缓冲复用 + `copy`）。
-  **该修复已写但未在真机验证** —— 下次继续从这里开始。
+### 3. A pipelined frame loop without a frame copy
+- **What it did**: `session.Next()` and `SendVideoFrame` each ran in their own goroutine,
+  sending the previous frame while the next was captured.
+- **Symptom**: fps decayed from 10 to ~1 within about 100 frames, with no session reset.
+- **Root cause**: the slice returned by `session.Next()` is **only valid until the next
+  call** (one internal buffer is reused). The next `Next()` overwrote bytes the send goroutine
+  was still transmitting, corrupting the H.264 stream and desynchronising the panel's decoder.
+- **Fix**: copy the frame before sending. See the final section; this is what shipped.
 
-## 面板健康注意（重要）
+## Panel health (important)
 
-- 面板固件在"写入被拒→反复重开"的循环下会进入串口号丢失状态：
-  `turzx info` 中 serial 为空。此时**多面板按串口固定路由会退化为
-  单面板模式**（cmd/turzx panelPlan 已有此回退），否则两个 supervisor
-  会抢同一设备（`claim interface ... bad access`）。
-- 恢复手段只有物理重插（两个都拔、等 10 秒、插回）。
-- 任何新方案验证前，先 `./turzx info` 确认两块屏 serial 都在。
+- Under a "writes rejected → reopen repeatedly" loop the firmware can enter a state where it
+  has lost its serial number: `turzx info` shows an empty serial. Serial-pinned multi-panel
+  routing then degrades to single-panel mode (`cmd/turzx` `panelPlan` has this fallback);
+  otherwise two supervisors would fight over the same device (`claim interface ... bad access`).
+- The only recovery is a physical replug: unplug both, wait 10 seconds, plug them back in.
+- Before verifying any new approach, run `./turzx info` and confirm both panels show a serial.
 
-## 候选方向（未验证）
+## Final result: the pipeline was never the limit, the test content was
 
-按预期收益排序：
+The pipelined loop with the frame copy (`internal/manager/stream.go`) is what ships.
 
-1. **验证流水线 + 帧拷贝**（代码已就位）。理论上限 ~25fps（采集端
-   常态上限），把 USB 往返完全藏进采集等待后面。
-2. **合并 probe**：把 flushLocked 的 5 次 1ms probe 改为一次
-   1ms + 无数据即返回（现在 flushAttempts=5，空端点只付 1 次 1ms，
-   已经接近这个形态；剩余收益小）。
-3. **降低 queueDepth 轮询成本**：每帧一次 CmdStreamStatus 往返
-   （~几 ms）。可改为每 N 帧一次 + 本地令牌桶推算，风险是节奏
-   失准导致队列溢出（回到崩溃循环），需要小心验证。
-4. **编码端**：`MaxKeyFrameInterval` 目前 = fps（每秒一个 IDR）。
-   关键帧 ~9.5KB vs P 帧 ~1KB。若改为 2s 一个 IDR，平均帧减半，
-   USB 时间减半 —— 代价是切屏/重连后 2 秒内画面落后。此项
-   与面板解码无关，纯主机侧收益。
-5. **ScreenCaptureKit 发帧节奏**：capture-only 25fps 意味着即使 USB
-   完全隐藏，25fps 也是天花板。SCStreamConfiguration
-   `minimumFrameInterval` 已设为 1/fps；剩余空间在
-   `queueDepth`（当前 5）与 SCContentFilter 的排除列表 —— 未测。
+- The ~15 fps seen earlier came from the **test animation window** (an `NSView drawRect` plus a
+  timer), which could only repaint at about 12 fps. ScreenCaptureKit emits frames only when
+  the content changes. With a Core Animation (GPU-composited) test window:
+  **two panels at once ran at 29.4 fps (target 30), queue=0, sendwait=0 ms, zero resets.**
+- Per frame: rotation ~1.6 ms, encoder submit ~0.2 ms; the USB send is fully hidden by the
+  pipeline.
+- With real content (a playing video) the panel runs at roughly 21–27 fps, following the
+  video's own frame delivery. A static desktop produces no frames, which is normal.
+- Shutdown order fixed: wait for the last send to finish, then `StopStream`.
+- Test-window coordinates are Cocoa (bottom-left origin); CG y=1692 is Cocoa y=-720.
+- Default orientation is now landscape (1920×720 virtual display, rotated into the 720×1920
+  panel).
+- `TURZX_PROF=1` prints per-stage timings inside the capture callback.
 
-## 测量工具（本会话用过的）
+## Remaining ideas (unverified, only worth it if more speed is needed)
 
-- `/tmp/animwin`：在虚拟屏上放动画窗口（真实变化内容），否则
-  ScreenCaptureKit 只在内容变化时发帧，测不出真实上限。
-- `turzx video <预编码.h264>`：绕过采集，测 USB+解码上限。
-- 单面板验证：`--serial <serial>` 固定一块屏，排除多屏干扰。
-- `--verbose` 的统计行含 `queue=`：队列恒 0 = 主机侧瓶颈；
-  队列 >3 = 面板侧跟不上。
+1. **Encoder GOP**: `MaxKeyFrameInterval` equals the fps (one IDR per second). A key frame is
+   ~9.5 KB against ~1 KB for a P frame; an IDR every 2 s would halve the average frame size, at
+   the cost of the picture lagging for up to 2 s after a reconnect.
+2. **Cheaper queue polling**: one `CmdStreamStatus` round trip per frame. Polling every N frames
+   with a local token bucket would save it, but a pacing error means queue overflow and the
+   crash loop; verify carefully.
+3. **ScreenCaptureKit `queueDepth`** (currently 5) and the content-filter exclusion list:
+   untested.
 
+## Measurement tools
 
-## v3 流水线验证结果（帧拷贝修复后，双面板同时）
-
-- 两块屏同时推流 + 动画窗口，每块 **~15.5 fps 稳定**，无衰减、无会话重置、queue=0。
-- 结论：帧拷贝修复了流水线的数据破坏（不再从 10 衰减到 1），但 **fps 没有提升**。
-  瓶颈不在 USB 往返串行；下一步应单面板对比，并在采集/编码端（候选 4、5）找。
-- 同时修了退出顺序：先等最后一次发送完成再 StopStream。
-
-## 结论（最终）：瓶颈是测试内容，不是管线
-
-- 之前 ~15fps 的根因是测试动画窗口（`NSView drawRect` + 定时器）自身只能重绘 ~12fps，
-  ScreenCaptureKit 只在内容变化时发帧。改用 Core Animation（GPU 合成）后：
-  **双面板同时 29.4 fps（目标 30），queue=0，sendwait=0ms，零重置。**
-- 每帧：旋转 ~1.6ms，编码提交 ~0.2ms，USB 发送被流水线完全隐藏。
-- 真实桌面（窗口拖动、视频）内容变化时即可达到 30fps；静态桌面不发帧是正常的。
-- 注意：测试窗口坐标用 Cocoa（左下原点），CG 的 y=1692 对应 Cocoa y=-720。
-- 默认方向改为 landscape（1920×720 虚拟屏，旋转后推给 720×1920 面板）。
-- `TURZX_PROF=1` 打印回调内各阶段耗时。
+- An animated window on the virtual display (real changing content); otherwise ScreenCaptureKit
+  only sends frames when something changes and the true ceiling cannot be measured. Use Core
+  Animation, not `drawRect`.
+- `turzx video <pre-encoded.h264>`: bypasses capture, measures the USB + decode ceiling.
+- `--serial <serial>` pins a single panel to rule out interference between panels.
+- The stats line of `--verbose` includes `queue=`: constant 0 means the host is the bottleneck,
+  above 3 means the panel cannot keep up. `capwait` / `sendwait` split the time between waiting
+  for capture and waiting for USB.

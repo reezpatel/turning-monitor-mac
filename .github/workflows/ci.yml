@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install libusb
+        run: brew install libusb pkg-config
+      - name: Vet and test
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+          go vet ./...
+          go test ./...
+      - name: Build the Manager app
+        run: ./packaging/manager-app/build-app.sh

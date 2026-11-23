@@ -44,8 +44,8 @@ swiftc \
     -framework ScreenCaptureKit -framework VideoToolbox \
     -framework CoreMedia -framework CoreVideo -framework CoreGraphics \
     -framework Accelerate -framework Foundation \
-    -lusb-1.0 \
-    -L"${LIBUSB_PREFIX:-/opt/homebrew/opt/libusb}/lib" \
+    "${LIBUSB_PREFIX:-/opt/homebrew/opt/libusb}/lib/libusb-1.0.a" \
+    -framework IOKit -framework Security -framework CoreFoundation \
     -o "$APP/Contents/MacOS/Turing Monitor Manager"
 
 echo "==> writing Info.plist"

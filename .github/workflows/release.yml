@@ -1,155 +1,53 @@
-name: release
+name: Release
 
-# Builds a binary per platform and attaches them to a GitHub release, so people
-# can use this without installing Go.
-#
-# Push a tag to trigger it:
-#
-#     git tag v0.1.0 && git push origin v0.1.0
-#
-# ---------------------------------------------------------------------------
-# REQUIRED ONE-TIME SETUP
-#
-# New personal repositories default to READ-ONLY workflow permissions, and a
-# workflow-level `permissions: contents: write` does not reliably override
-# that. The build jobs will succeed and the release job will fail with
-# "Resource not accessible by integration".
-#
-# Enable it once under:
-#   Settings > Actions > General > Workflow permissions
-#     -> "Read and write permissions"
-#
-# or from the command line:
-#   gh api -X PUT repos/OWNER/REPO/actions/permissions/workflow \
-#     -f default_workflow_permissions=write
-#
-# Note that changing the setting does not affect runs that already started;
-# a failed run has to be re-triggered by deleting and re-pushing the tag.
-# ---------------------------------------------------------------------------
-#
-# Note on cgo: the USB layer wraps libusb through cgo, so every target is built
-# on an architecture-matched runner. GOARCH is deliberately not set anywhere --
-# Go silently disables cgo when cross-compiling, which drops every file that
-# imports "C" and produces a build that fails with confusing errors about
-# undefined symbols in gousb and internal/metrics. Building on a matching
-# runner is what keeps cgo on.
-#
-# GitHub retires the last Intel macOS image in August 2027, after which
-# darwin/amd64 will have to be dropped or built some other way.
-#
-# The resulting binaries link libusb dynamically, so macOS users still need
-# `brew install libusb` and Linux users `libusb-1.0-0`. That is documented in
-# the README.
-
+# Builds the macOS Manager app (Apple Silicon) and the turzx CLI, and attaches
+# them to a GitHub release. Push a tag such as v1.0.0, or run it by hand.
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
 
-# Least privilege by default; the release job opts into write for itself.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
-    name: build ${{ matrix.artifact }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      # Keep going if one target fails; a missing arm64 build should not cost
-      # the other three.
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-14 # Apple Silicon
-            artifact: turzx-darwin-arm64
-          - os: macos-15-intel # last Intel image; retired August 2027
-            artifact: turzx-darwin-amd64
-          - os: ubuntu-24.04
-            artifact: turzx-linux-amd64
-          - os: ubuntu-24.04-arm
-            artifact: turzx-linux-arm64
-
+  macos:
+    runs-on: macos-15   # Apple Silicon
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
-
-      - name: Install libusb (macOS)
-        if: runner.os == 'macOS'
-        run: brew install libusb
-
-      - name: Install libusb (Linux)
-        if: runner.os == 'Linux'
+          go-version-file: go.mod
+      - name: Install libusb
+        run: brew install libusb pkg-config
+      - name: Test
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libusb-1.0-0-dev
-
-      - name: Build
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+          go test ./...
+      - name: Build the Manager app
+        run: ./packaging/manager-app/build-app.sh
+      - name: Build the turzx CLI
         run: |
-          # Homebrew's libusb is not on the default pkg-config path, and its
-          # prefix differs between architectures (/opt/homebrew vs /usr/local),
-          # so ask rather than assume.
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
-          fi
-          echo "building ${{ matrix.artifact }} for $(go env GOOS)/$(go env GOARCH), cgo=$(go env CGO_ENABLED)"
-          go build -trimpath -ldflags "-s -w" -o ${{ matrix.artifact }} ./cmd/turzx
-
-      - name: Verify the binary runs
-        # A build that links but cannot start is the failure mode worth
-        # catching, since the dynamically linked libusb is the risky part.
-        run: ./${{ matrix.artifact }} --help
-
-      - name: Upload build
-        uses: actions/upload-artifact@v4
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+          CC=clang go build -o turzx ./cmd/turzx
+      - name: Package
+        run: |
+          mkdir dist
+          ditto -c -k --keepParent "packaging/manager-app/Turing Monitor Manager.app" \
+            dist/Turing-Monitor-Manager-macos-arm64.zip
+          zip -j dist/turzx-macos-arm64.zip turzx
+          (cd dist && shasum -a 256 *.zip > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-          if-no-files-found: error
-
-  # Collecting the uploads into one job rather than letting every matrix leg
-  # publish avoids several jobs racing to create and update the same release.
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - name: Download all builds
-        uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-          path: dist
-
-      - name: List what will be published
-        run: ls -la dist
-
+          name: macos-arm64
+          path: dist/*
       - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
           body: |
-            > [!WARNING]
-            > 本项目是非官方的第三方实现，与图灵智显（TURZX）官方无关，**不是官方驱动**。
-            > 使用中若因软件实现的局限、操作失误或硬件差异导致屏幕异常
-            > 乃至损坏，**风险与后果由使用者自行承担**。
-            > 详见 [README](https://github.com/jijiechen/turing-monitor#免责声明)。
-
-            预编译二进制见下方附件。它们动态链接 libusb，所以请先安装：
-
-              macOS          brew install libusb
-              Debian/Ubuntu  sudo apt install libusb-1.0-0
-
-            macOS 版本未签名，首次运行需要「右键 → 打开」，或者：
-
-              xattr -d com.apple.quarantine ./turzx-darwin-arm64
-
-            Linux 上请安装 `packaging/linux/` 里的 udev 规则，否则每次运行都需要
-            root 权限。
-
-            注意：Linux 相关功能尚未在真机上验证，当前状态见 README。
+            **Unsigned builds for Apple Silicon.** After downloading, right-click > Open, or run
+            `xattr -dr com.apple.quarantine "Turing Monitor Manager.app"`. The app needs Screen
+            Recording permission. `turzx` needs `brew install libusb`.
