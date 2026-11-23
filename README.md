@@ -49,7 +49,7 @@ What you can do with it:
 - **Pipelined streaming.** Encoding the next frame overlaps with the USB send of the previous
   one. Measured on two panels at once: about 29 fps against a 30 fps target with animated
   content. Capture only produces frames when the screen changes, so a static desktop shows a
-  low fps. Measurements and rejected approaches: [framerate-issues.md](framerate-issues.md).
+  low fps.
 - **Per-second stats.** `turzx monitor --verbose` prints `fps`, `queue`, `capwait` (time
   waiting for capture) and `sendwait` (time waiting for USB). `TURZX_PROF=1` adds per-stage
   timings inside the capture callback.
@@ -377,7 +377,6 @@ internal/vdisplay/      creates or finds a virtual display
 internal/capture/       captures a display and encodes it as H.264
 packaging/manager-app/  SwiftUI menu-bar Manager app
 docs/PROTOCOL.md        protocol reference
-framerate-issues.md     frame-rate measurements and rejected approaches
 ```
 
 ## Development
