@@ -18,9 +18,9 @@ import (
 // setup.
 //
 // The loop is pipelined: the previous frame is sent while the next is being
-// encoded, which hides the USB round trip behind capture latency. See
-// the measurements (about 29 fps on two panels at once), and note the frame copy -- the capture session reuses one buffer, so the bytes must
-// be owned before the send goroutine touches them.
+// encoded, which hides the USB round trip behind capture latency (about 29 fps
+// on two panels at once). Note the frame copy: the capture session reuses one
+// buffer, so the bytes must be owned before the send goroutine touches them.
 func streamToPanel(ctx context.Context, dev *usb.Device, session *capture.Session, fps int, log io.Writer) error {
 	if err := dev.BeginPlayback(fps); err != nil {
 		return err
