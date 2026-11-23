@@ -1,0 +1,10 @@
+# Built binary
+/turzx
+/dist/
+
+# macOS
+.DS_Store
+
+# Manager app build output (rebuild with packaging/manager-app/build-app.sh)
+/packaging/manager-app/build/
+/packaging/manager-app/*.app/

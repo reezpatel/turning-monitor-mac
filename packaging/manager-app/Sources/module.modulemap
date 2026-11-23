@@ -1,0 +1,4 @@
+module CTurzx {
+    header "libturzx.h"
+    export *
+}

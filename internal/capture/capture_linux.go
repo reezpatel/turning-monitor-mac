@@ -1,0 +1,268 @@
+//go:build linux
+
+package capture
+
+import (
+	"bufio"
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strconv"
+	"sync"
+
+	"github.com/jijiechen/turing-monitor/internal/framesrc"
+)
+
+// chunkSize is how much of the encoded stream to read per call.
+//
+// It trades latency against USB overhead: ffmpeg will not hand over data until
+// this much has accumulated, so a large value adds delay, while a small one
+// multiplies the number of USB transfers. At the default bitrate this is about
+// half a frame.
+const chunkSize = 32 * 1024
+
+// Session is a running capture.
+type Session struct {
+	cmd    *exec.Cmd
+	stdout io.ReadCloser
+	reader *bufio.Reader
+	buf    []byte
+
+	// stderr collects ffmpeg's diagnostics so a failure can be reported with
+	// its actual reason rather than just "exit status 1".
+	stderr   *bytes.Buffer
+	stderrWG sync.WaitGroup
+
+	// source is set when the frames come from a display rather than from
+	// screen capture.
+	source framesrc.Source
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// Start begins capturing a screen region with ffmpeg.
+//
+// ffmpeg is used rather than a Go X11 binding because it handles both capture
+// and H.264 encoding, including the hardware encoders, in one well-tested
+// place. The output is an Annex-B elementary stream on stdout, the same shape
+// the macOS backend produces.
+func Start(opts Options) (*Session, error) {
+	opts, err := opts.normalise()
+	if err != nil {
+		return nil, err
+	}
+
+	// A display that owns its framebuffer needs no capture at all: the pixels
+	// are already there, so ffmpeg only has to encode them.
+	if opts.Source != nil {
+		return startFromSource(opts)
+	}
+
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return nil, errors.New("capture: ffmpeg is required for screen capture on Linux; " +
+			"install it with: sudo apt install ffmpeg")
+	}
+	display := os.Getenv("DISPLAY")
+	if display == "" {
+		return nil, errors.New("capture: DISPLAY is not set; " +
+			"screen capture needs an X11 session (Wayland is not supported)")
+	}
+
+	// x11grab addresses the screen by region rather than by output.
+	input := fmt.Sprintf("%s+%d,%d", display, opts.X, opts.Y)
+	args := []string{
+		"-loglevel", "error",
+		"-f", "x11grab",
+		"-framerate", strconv.Itoa(opts.FPS),
+		"-video_size", fmt.Sprintf("%dx%d", opts.Width, opts.Height),
+		"-i", input,
+		// ffmpeg rotates as part of encoding, so a quarter turn costs nothing
+		// beyond the normal transcode. The transposition values are ffmpeg's:
+		// 1 is a quarter turn clockwise, 2 a half turn, 3 anticlockwise.
+		"-vf", fmt.Sprintf("transpose=%d", opts.QuarterTurns),
+		"-c:v", "libx264",
+		// ultrafast + zerolatency keeps the encoder from buffering, which
+		// would otherwise add whole frames of delay.
+		"-preset", "ultrafast",
+		"-tune", "zerolatency",
+		"-profile:v", "high",
+		"-pix_fmt", "yuv420p",
+		"-b:v", strconv.Itoa(opts.Bitrate),
+		// Allow bursts above the average, so frames dense with text are not
+		// starved and left looking soft.
+		"-maxrate", strconv.Itoa(opts.Bitrate * 3 / 2),
+		"-bufsize", strconv.Itoa(opts.Bitrate * 2),
+		// Refresh with an IDR once a second. A longer interval lets P-frame
+		// error accumulate into trailing behind moving content.
+		"-g", strconv.Itoa(opts.FPS),
+		"-f", "h264",
+		"-",
+	}
+
+	cmd := exec.Command(ffmpeg, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("capture: ffmpeg stdout: %w", err)
+	}
+
+	s := &Session{
+		cmd:    cmd,
+		stdout: stdout,
+		reader: bufio.NewReaderSize(stdout, 2*chunkSize),
+		buf:    make([]byte, chunkSize),
+		stderr: &bytes.Buffer{},
+	}
+	cmd.Stderr = s.stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("capture: start ffmpeg: %w", err)
+	}
+	return s, nil
+}
+
+// Next returns the next slice of the encoded stream, blocking until enough
+// data has accumulated.
+//
+// The slice is only valid until the following call.
+func (s *Session) Next() ([]byte, error) {
+	n, err := io.ReadFull(s.reader, s.buf)
+	if n > 0 {
+		return s.buf[:n], nil
+	}
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return nil, fmt.Errorf("capture: ffmpeg stopped%s", s.stderrDetail())
+	}
+	return nil, fmt.Errorf("capture: read from ffmpeg: %w%s", err, s.stderrDetail())
+}
+
+// stderrDetail appends ffmpeg's own message, which is the useful part of any
+// failure here.
+func (s *Session) stderrDetail() string {
+	msg := bytes.TrimSpace(s.stderr.Bytes())
+	if len(msg) == 0 {
+		return ""
+	}
+	return ": " + string(msg)
+}
+
+// Close stops ffmpeg and releases the pipe.
+func (s *Session) Close() error {
+	s.closeOnce.Do(func() {
+		if s.cmd.Process != nil {
+			// Closing stdout first unblocks any pending read, so ffmpeg does
+			// not have to be killed hard.
+			_ = s.stdout.Close()
+			if err := s.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				s.closeErr = err
+			}
+		}
+		_ = s.cmd.Wait()
+	})
+	return s.closeErr
+}
+
+// startFromSource encodes frames that a display already owns.
+//
+// There is no screen capture on this path. The pixels come from the display
+// itself, which is what evdi provides, so ffmpeg is used purely as an encoder
+// and the whole detour through a compositor disappears.
+func startFromSource(opts Options) (*Session, error) {
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return nil, errors.New("capture: ffmpeg is required to encode the display's frames; " +
+			"install it with: sudo apt install ffmpeg")
+	}
+
+	pixFmt, err := ffmpegPixelFormat(opts.Source.Format())
+	if err != nil {
+		return nil, err
+	}
+
+	args := []string{
+		"-loglevel", "error",
+		"-f", "rawvideo",
+		"-pixel_format", pixFmt,
+		"-video_size", fmt.Sprintf("%dx%d", opts.Width, opts.Height),
+		"-framerate", strconv.Itoa(opts.FPS),
+		"-i", "-",
+		"-vf", fmt.Sprintf("transpose=%d", opts.QuarterTurns),
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-tune", "zerolatency",
+		"-profile:v", "high",
+		"-pix_fmt", "yuv420p",
+		"-b:v", strconv.Itoa(opts.Bitrate),
+		"-maxrate", strconv.Itoa(opts.Bitrate * 3 / 2),
+		"-bufsize", strconv.Itoa(opts.Bitrate * 2),
+		"-g", strconv.Itoa(opts.FPS),
+		"-f", "h264",
+		"-",
+	}
+
+	cmd := exec.Command(ffmpeg, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("capture: ffmpeg stdin: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("capture: ffmpeg stdout: %w", err)
+	}
+
+	s := &Session{
+		cmd:    cmd,
+		stdout: stdout,
+		reader: bufio.NewReaderSize(stdout, 2*chunkSize),
+		buf:    make([]byte, chunkSize),
+		stderr: &bytes.Buffer{},
+		source: opts.Source,
+	}
+	cmd.Stderr = s.stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("capture: start ffmpeg: %w", err)
+	}
+
+	go s.pumpFrames(stdin)
+	return s, nil
+}
+
+// pumpFrames feeds the encoder until the source or ffmpeg stops.
+func (s *Session) pumpFrames(w io.WriteCloser) {
+	defer w.Close()
+	for {
+		pix, _, _, err := s.source.NextFrame()
+		if err != nil {
+			return
+		}
+		if _, err := w.Write(pix); err != nil {
+			// ffmpeg has gone away, which Next() will report.
+			return
+		}
+	}
+}
+
+// ffmpegPixelFormat names the layout the way ffmpeg expects.
+//
+// A DRM fourcc describes a 32-bit word; ffmpeg names the byte order in memory
+// on a little-endian machine. So XRGB and ARGB both lay bytes down as blue,
+// green, red, then an unused byte, which ffmpeg calls bgra. Getting this
+// backwards produces a picture with the red and blue channels swapped, which
+// is obvious on screen but easy to misread as a colour problem elsewhere.
+func ffmpegPixelFormat(f framesrc.Format) (string, error) {
+	switch f {
+	case framesrc.FormatXRGB888, framesrc.FormatARGB888:
+		return "bgra", nil
+	case framesrc.FormatXBGR888, framesrc.FormatABGR888:
+		return "rgba", nil
+	case framesrc.FormatRGB565:
+		return "rgb565le", nil
+	default:
+		return "", fmt.Errorf("capture: no ffmpeg pixel format for %s (%#x)", f, uint32(f))
+	}
+}
